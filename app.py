@@ -3,7 +3,7 @@ import pandas as pd
 import kagglehub
 import plotly.express as px
 import plotly.graph_objects as go
-import numpy as np # Adicionando a importação do numpy
+import numpy as np
 
 # Configuração da página
 st.set_page_config(
@@ -17,11 +17,15 @@ st.set_page_config(
 # ------------------------------------
 @st.cache_data
 def load_data():
-    """Baixa, carrega e pré-processa o dataset do Google Play Store do Kaggle."""
+    """
+    Baixa, carrega e pré-processa o dataset do Google Play Store do Kaggle.
+    Contém a limpeza de dados robusta para resolver o erro 'ValueError: could not convert string to float'.
+    Requer as variáveis KAGGLE_USERNAME e KAGGLE_KEY configuradas nos Secrets do Streamlit Cloud.
+    """
     try:
         st.write("Baixando dataset do Kaggle Hub...")
         
-        # Baixa o dataset
+        # Tenta baixar o dataset usando as credenciais configuradas no ambiente
         dataset_path = kagglehub.dataset_download("lava18/google-play-store-apps")
         file_path = f"{dataset_path}/googleplaystore.csv"
         
@@ -29,25 +33,44 @@ def load_data():
         df = pd.read_csv(file_path)
         
     except Exception as e:
-        st.error(f"Erro ao carregar os dados do Kaggle Hub: {e}")
+        # Mensagem de erro robusta para falha de autenticação
+        st.error(f"Erro ao carregar os dados do Kaggle Hub. Verifique se as chaves KAGGLE_USERNAME e KAGGLE_KEY estão configuradas corretamente nos Secrets do Streamlit Cloud.")
+        st.error(f"Detalhe do erro: {e}")
         return pd.DataFrame()
 
     # Limpeza e Pré-processamento
     
-    # Remove a linha com dados incorretos ou outliers conhecidos
+    # 1. TRATAMENTO DE LINHAS CORROMPIDAS
+    # Remove as linhas conhecidas que corrompem o dataset:
+    # - 'Life Made Better' (linha com Category=1.9 que desalinhou colunas)
+    # - A linha onde 'Category' é '1.9' (segunda ocorrência do problema)
     df.drop(df[df['App'] == 'Life Made Better'].index, inplace=True)
+    df.drop(df[df['Category'] == '1.9'].index, inplace=True)
     
-    # Limpa e converte 'Installs' para numérico
-    df['Installs'] = df['Installs'].astype(str).str.replace('+', '').str.replace(',', '', regex=True).astype(float)
+    # 2. LIMPEZA E CONVERSÃO ROBUSTA DE 'Installs'
+    # Remove caracteres (+ e ,)
+    df['Installs'] = df['Installs'].astype(str).str.replace('+', '', regex=False).str.replace(',', '', regex=True)
+    # CORREÇÃO CRÍTICA: pd.to_numeric com errors='coerce' converte strings inválidas (como 'Free' desalinhado) em NaN
+    df['Installs'] = pd.to_numeric(df['Installs'], errors='coerce')
     
-    # Converte 'Reviews' para numérico
+    # 3. LIMPEZA E CONVERSÃO DE 'Reviews'
     df['Reviews'] = pd.to_numeric(df['Reviews'], errors='coerce')
     
-    # Limpa e converte 'Price' para numérico
-    df['Price'] = df['Price'].astype(str).str.replace('$', '', regex=True).astype(float)
+    # 4. LIMPEZA E CONVERSÃO DE 'Price'
+    # Remove o '$' antes de converter
+    df['Price'] = df['Price'].astype(str).str.replace('$', '', regex=True)
+    # CORREÇÃO: Converte strings (incluindo possíveis desalinhamentos) em NaN se não forem números
+    df['Price'] = pd.to_numeric(df['Price'], errors='coerce')
+
+    # 5. LIMPEZA DE 'Size' (para evitar problemas futuros)
+    # Esta é uma etapa extra de robustez
+    df['Size'] = df['Size'].astype(str).str.replace('M', '', regex=False).str.replace('k', '', regex=False).str.replace(',', '', regex=True)
+    df['Size'] = df['Size'].replace('Varies with device', np.nan)
+    df['Size'] = pd.to_numeric(df['Size'], errors='coerce')
     
-    # Remove valores nulos essenciais
-    df.dropna(subset=['Rating', 'Installs', 'Reviews', 'Price'], inplace=True)
+    # 6. REMOÇÃO DE VALORES NULOS ESSENCIAIS
+    # Remove linhas onde os valores essenciais (incluindo os NaN gerados pelas conversões de strings inválidas acima) são nulos.
+    df.dropna(subset=['Rating', 'Installs', 'Reviews', 'Price', 'Category', 'Type'], inplace=True)
     
     # Cria uma métrica de popularidade: Engajamento/Instalações
     df['Popularity_Score'] = df['Reviews'] / df['Installs']
@@ -62,6 +85,11 @@ df = load_data()
 # 2. SIDEBAR E FILTROS
 # ------------------------------------
 st.sidebar.header("Filtros de Análise")
+
+# Garante que os dados foram carregados antes de aplicar filtros
+if df.empty:
+    st.error("O aplicativo foi interrompido devido a um erro na autenticação ou carregamento de dados.")
+    st.stop()
 
 # Filtro 1: Categoria
 all_categories = ['Todas'] + sorted(df['Category'].unique().tolist())
@@ -80,9 +108,9 @@ if selected_category != 'Todas':
 if selected_type != 'Ambos':
     df_filtered = df_filtered[df_filtered['Type'] == selected_type]
 
-# Garante que o DataFrame não está vazio
+# Garante que o DataFrame não está vazio após os filtros
 if df_filtered.empty:
-    st.error("Nenhum dado corresponde aos filtros selecionados.")
+    st.error("Nenhum dado corresponde aos filtros selecionados. Tente ajustar os filtros.")
     st.stop()
 
 
@@ -107,13 +135,20 @@ avg_rating = df_filtered['Rating'].mean()
 col2.metric("Avaliação Média", f"{avg_rating:.2f} / 5.0", help="Nota média dos aplicativos no filtro.")
 
 # KPI 3: Aplicativo de Maior Sucesso
-# Usa a métrica Popularity_Score (Reviews/Installs) para evitar vieses de apps muito antigos
-app_mais_popular = df_filtered.loc[df_filtered['Popularity_Score'].idxmax()]
-col3.metric("App Mais Popular (Score)", f"{app_mais_popular['Popularity_Score']:.4f}", help=f"Baseado na relação Reviews/Installs. App: {app_mais_popular['App']}")
+# Garante que o KPI não quebre em filtros vazios
+if not df_filtered.empty and 'Popularity_Score' in df_filtered and df_filtered['Popularity_Score'].max() >= 0:
+    app_mais_popular = df_filtered.loc[df_filtered['Popularity_Score'].idxmax()]
+    col3.metric("App Mais Popular (Score)", f"{app_mais_popular['Popularity_Score']:.4f}", help=f"Baseado na relação Reviews/Installs. App: {app_mais_popular['App']}")
+else:
+    col3.metric("App Mais Popular (Score)", "N/A", help="Dados insuficientes para calcular o score de popularidade.")
+
 
 # KPI 4: Aplicativo mais caro
-app_mais_caro = df_filtered.loc[df_filtered['Price'].idxmax()]
-col4.metric("Preço Máximo", f"${app_mais_caro['Price']:.2f}", help=f"App: {app_mais_caro['App']}")
+if not df_filtered.empty and 'Price' in df_filtered and df_filtered['Price'].max() > 0:
+    app_mais_caro = df_filtered.loc[df_filtered['Price'].idxmax()]
+    col4.metric("Preço Máximo", f"${app_mais_caro['Price']:.2f}", help=f"App: {app_mais_caro['App']}")
+else:
+    col4.metric("Preço Máximo", "$0.00", help="Nenhum aplicativo pago no filtro.")
 
 st.markdown("---")
 
@@ -150,7 +185,8 @@ with col_chart_2:
     # Filtra apenas apps pagos
     df_paid = df_filtered[df_filtered['Type'] == 'Paid']
     
-    if not df_paid.empty:
+    # Condição para desenhar o gráfico apenas se houver dados pagos válidos
+    if not df_paid.empty and 'Price' in df_paid and df_paid['Price'].max() > 0:
         # Usa um histograma interativo para mostrar a concentração de preços
         fig_price_hist = px.histogram(
             df_paid, 
@@ -170,7 +206,6 @@ st.markdown("---")
 # GRÁFICO 3: Gráfico de Dispersão (Dispersão de Desempenho)
 st.header("Dispersão de Desempenho (Avaliação vs. Revisões)")
 
-# Usa o `Size` do App no eixo Z (tamanho da bolha)
 fig_scatter = px.scatter(
     df_filtered,
     x='Reviews',
@@ -204,6 +239,7 @@ with col_donut:
 with col_ranking:
     st.subheader("Top 10 Aplicativos por Installs")
     df_top_apps = df_filtered.nlargest(10, 'Installs')[['App', 'Installs', 'Category']]
+    # Garante que 'Installs' é um float para a formatação
     df_top_apps['Installs Formatado'] = df_top_apps['Installs'].apply(lambda x: f'{x:,.0f}')
     st.dataframe(df_top_apps[['App', 'Category', 'Installs Formatado']], use_container_width=True, hide_index=True)
 
